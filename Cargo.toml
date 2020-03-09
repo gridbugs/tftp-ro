@@ -1,5 +1,5 @@
 [package]
-name = "minitftpd"
+name = "tftp-ro"
 version = "0.1.0"
 authors = ["Stephen Sherratt <stephen@sherra.tt>"]
 edition = "2018"
@@ -8,3 +8,5 @@ edition = "2018"
 tokio = { version = "0.2", features = ["macros", "fs", "udp", "stream", "io-util"] }
 futures = "0.3"
 simon = "0.3"
+env_logger = "0.7"
+log = "0.4"

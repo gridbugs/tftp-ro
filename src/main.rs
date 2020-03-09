@@ -187,16 +187,16 @@ async fn run_server(socket_addr: SocketAddr, directory: &str) {
             Ok(rrq) => match handle_rrq(socket_addr, directory, client_addr, rrq).await {
                 Ok(()) => (),
                 Err(FileNotFound) => {
-                    println!("file not found");
+                    log::warn!("file not found");
                     handle_error(socket_addr, client_addr, ResponseError::FileNotFound).await;
                 }
             },
             Err(MainSocketError::ParseError) => {
-                println!("failed to parse request");
+                log::warn!("failed to parse request");
                 handle_error(socket_addr, client_addr, ResponseError::ParseError).await;
             }
             Err(MainSocketError::WriteIsNotImplemented) => {
-                println!("write is not implemented");
+                log::warn!("write is not implemented");
                 handle_error(socket_addr, client_addr, ResponseError::Unimplemented).await;
             }
         }
@@ -213,84 +213,38 @@ async fn handle_rrq(
     rrq: Rrq,
 ) -> Result<(), FileNotFound> {
     let path = std::path::Path::new(directory).join(rrq.filename.as_str());
-    let file = fs::File::open(&path).await.map_err(|_| FileNotFound)?;
-    println!(
-        "sending file \"{}\" with mode {:?}",
-        path.to_string_lossy(),
-        rrq.mode
-    );
-    send_file(socket_addr, client_addr, file, rrq.mode).await;
-    Ok(())
-}
-
-async fn send_file(
-    socket_addr: SocketAddr,
-    client_addr: ClientAddr,
-    mut file: fs::File,
-    mode: Mode,
-) {
+    let mut file = fs::File::open(&path).await.map_err(|_| FileNotFound)?;
+    const BLOCK_SIZE: usize = 512;
     use tokio::io::AsyncReadExt;
     let mut ephemeral_socket = make_ephemeral_socket(socket_addr).await;
     let mut all_data = Vec::new();
     file.read_to_end(&mut all_data).await.unwrap();
-    let num_full_chunks = all_data.len() / CHUNK_SIZE;
-    let num_chunks = num_full_chunks + 1;
-    println!("num_chunks: {}", num_chunks);
-    for i in 0..num_chunks {
-        let slice = if i < num_full_chunks {
-            &all_data[i * CHUNK_SIZE..(i + 1) * CHUNK_SIZE]
+    let num_full_blocks = all_data.len() / BLOCK_SIZE;
+    let num_blocks = num_full_blocks + 1;
+    log::info!(
+        "Sending file \"{}\" with mode {:?} (ignored) as {} blocks",
+        path.to_string_lossy(),
+        rrq.mode,
+        num_blocks,
+    );
+    for i in 0..num_blocks {
+        let slice = if i < num_full_blocks {
+            &all_data[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE]
         } else {
-            &all_data[i * CHUNK_SIZE..]
+            &all_data[i * BLOCK_SIZE..]
         };
         let buf = data_packet(i as u16 + 1, slice);
-        println!("sending chunk {}", i + 1);
         ephemeral_socket.send_to(&buf, client_addr.0).await.unwrap();
         let mut buf = [0; 4];
         ephemeral_socket.recv(&mut buf).await.unwrap();
-        println!(
-            "received ack for chunk {}",
-            (buf[2] as u16) << 8 | buf[3] as u16
-        );
     }
+    Ok(())
 }
-
-const CHUNK_SIZE: usize = 512;
 
 fn data_packet(block_num: u16, data: &[u8]) -> Vec<u8> {
     let mut packet = vec![0, 3, (block_num >> 8) as u8, block_num as u8];
     packet.extend_from_slice(data);
     packet
-}
-
-async fn chunk_file(mut file: fs::File) -> impl Stream<Item = Vec<u8>> {
-    use tokio::io::AsyncReadExt;
-    let mut all_data = Vec::new();
-    file.read_to_end(&mut all_data).await.unwrap();
-    let num_full_chunks = all_data.len() / CHUNK_SIZE;
-    let num_chunks = num_full_chunks + 1;
-    println!("num_chunks: {}", num_chunks);
-    futures::stream::unfold((1, all_data), move |(block_num, all_data)| async move {
-        use std::cmp::Ordering;
-        let index = block_num - 1;
-        println!("processing {}", index);
-        match block_num.cmp(&num_chunks) {
-            Ordering::Less => {
-                let slice = &all_data[index * CHUNK_SIZE..block_num * CHUNK_SIZE];
-                Some((
-                    data_packet(block_num as u16, slice),
-                    (block_num + 1, all_data),
-                ))
-            }
-            Ordering::Equal => {
-                let slice = &all_data[index * CHUNK_SIZE..];
-                Some((
-                    data_packet(block_num as u16, slice),
-                    (block_num + 1, all_data),
-                ))
-            }
-            Ordering::Greater => None,
-        }
-    })
 }
 
 #[tokio::main]
@@ -299,5 +253,6 @@ async fn main() {
         socket_addr,
         directory,
     } = Args::arg().with_help_default().parse_env_or_exit();
+    env_logger::init();
     run_server(socket_addr, directory.as_str()).await;
 }
