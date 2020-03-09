@@ -1,6 +1,7 @@
 use futures::stream::{Stream, StreamExt};
 use simon::Arg;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::time::Instant;
 use tokio::{fs, net::UdpSocket};
 
 const BUF_SIZE: usize = 2048;
@@ -212,39 +213,68 @@ async fn handle_rrq(
     client_addr: ClientAddr,
     rrq: Rrq,
 ) -> Result<(), FileNotFound> {
+    use tokio::io::AsyncReadExt;
+    const BLOCK_SIZE: usize = 512;
+    const DATA_OFFSET: usize = 4;
+    const OPCODE: u8 = 3;
+    let start_time = Instant::now();
+    log::info!(
+        "Handling read request for {} from {}",
+        rrq.filename,
+        client_addr.0
+    );
+
     let path = std::path::Path::new(directory).join(rrq.filename.as_str());
     let mut file = fs::File::open(&path).await.map_err(|_| FileNotFound)?;
-    const BLOCK_SIZE: usize = 512;
-    use tokio::io::AsyncReadExt;
     let mut ephemeral_socket = make_ephemeral_socket(socket_addr).await;
-    let mut all_data = Vec::new();
-    file.read_to_end(&mut all_data).await.unwrap();
-    let num_full_blocks = all_data.len() / BLOCK_SIZE;
-    let num_blocks = num_full_blocks + 1;
-    log::info!(
-        "Sending file \"{}\" with mode {:?} (ignored) as {} blocks",
-        path.to_string_lossy(),
-        rrq.mode,
-        num_blocks,
-    );
-    for i in 0..num_blocks {
-        let slice = if i < num_full_blocks {
-            &all_data[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE]
-        } else {
-            &all_data[i * BLOCK_SIZE..]
-        };
-        let buf = data_packet(i as u16 + 1, slice);
-        ephemeral_socket.send_to(&buf, client_addr.0).await.unwrap();
-        let mut buf = [0; 4];
-        ephemeral_socket.recv(&mut buf).await.unwrap();
+    let mut read_into_buf = vec![0u8; BLOCK_SIZE + DATA_OFFSET];
+    read_into_buf[0] = 0;
+    read_into_buf[1] = OPCODE;
+    read_into_buf[2] = 0;
+    read_into_buf[3] = 0;
+    let mut num_bytes_read = file.read(&mut read_into_buf[DATA_OFFSET..]).await.unwrap();
+    let mut send_from_buf = read_into_buf.clone();
+    let mut block_num = 0u16;
+    loop {
+        block_num += 1;
+        let next_read_into_buf_fut = file.read(&mut read_into_buf[DATA_OFFSET..]);
+        let send_data_fut = send_data(
+            block_num,
+            &mut send_from_buf[0..(DATA_OFFSET + num_bytes_read)],
+            &mut ephemeral_socket,
+            client_addr,
+        );
+        let (num_bytes_read_result, num_bytes_sent) =
+            tokio::join!(next_read_into_buf_fut, send_data_fut);
+        if num_bytes_sent != read_into_buf.len() {
+            break;
+        }
+        num_bytes_read = num_bytes_read_result.unwrap();
+        std::mem::swap(&mut read_into_buf, &mut send_from_buf);
     }
+    log::info!(
+        "Finished sending {} to {} after {:?}",
+        rrq.filename,
+        client_addr.0,
+        start_time.elapsed()
+    );
     Ok(())
 }
 
-fn data_packet(block_num: u16, data: &[u8]) -> Vec<u8> {
-    let mut packet = vec![0, 3, (block_num >> 8) as u8, block_num as u8];
-    packet.extend_from_slice(data);
-    packet
+async fn send_data(
+    block_num: u16,
+    send_from_buf: &mut [u8],
+    socket: &mut UdpSocket,
+    client_addr: ClientAddr,
+) -> usize {
+    send_from_buf[2] = (block_num >> 8) as u8;
+    send_from_buf[3] = block_num as u8;
+    let num_bytes_sent = socket.send_to(send_from_buf, client_addr.0).await.unwrap();
+    let mut ack_buf = [0; 4];
+    socket.recv(&mut ack_buf).await.unwrap();
+    assert_eq!(&ack_buf[0..2], &[0, 4]);
+    assert_eq!(&send_from_buf[2..4], &ack_buf[2..4]);
+    num_bytes_sent
 }
 
 #[tokio::main]
