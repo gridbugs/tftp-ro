@@ -12,6 +12,6 @@ repository = "https://github.com/stevebob/tftp-ro"
 [dependencies]
 tokio = { version = "0.2", features = ["macros", "fs", "udp", "stream", "io-util"] }
 futures = "0.3"
-simon = "0.3"
+simon = "0.4"
 env_logger = "0.7"
 log = "0.4"

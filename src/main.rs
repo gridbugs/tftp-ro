@@ -9,6 +9,7 @@ const BUF_SIZE: usize = 2048;
 struct Args {
     socket_addr: SocketAddr,
     directory: String,
+    rename: Option<String>,
 }
 
 impl Args {
@@ -17,12 +18,15 @@ impl Args {
             let {
                 socket_addr_v4 = simon::opt("a", "address", "serve on address", "HOST:PORT")
                     .with_default_lazy(|| SocketAddrV4::new(Ipv4Addr::new(0,0,0,0), 69));
-                directory = simon::opt("d", "directory", "serve files out of directory", "DIR")
-                    .with_default_lazy(|| ".".to_string());
+                directory = simon::free().vec_singleton().choice(
+                    simon::opt("d", "directory", "serve files out of directory", "DIR")
+                ).with_default_lazy(|| ".".to_string());
+                rename = simon::opt("r", "rename", "interpret requests for all files as requests for this file", "FILENAME");
             } in {
                 Self {
                     socket_addr: SocketAddr::V4(socket_addr_v4),
                     directory: directory.to_string(),
+                    rename,
                 }
             }
         }
@@ -176,7 +180,7 @@ impl MainSocket {
     }
 }
 
-async fn run_server(socket_addr: SocketAddr, directory: &str) {
+async fn run_server(socket_addr: SocketAddr, directory: &str, rename: Option<&str>) {
     MainSocket {
         socket: UdpSocket::bind(socket_addr).await.unwrap(),
         buf: vec![0; BUF_SIZE],
@@ -185,7 +189,7 @@ async fn run_server(socket_addr: SocketAddr, directory: &str) {
     .await
     .for_each_concurrent(None, |(client_addr, rrq_result)| async move {
         match rrq_result {
-            Ok(rrq) => match handle_rrq(socket_addr, directory, client_addr, rrq).await {
+            Ok(rrq) => match handle_rrq(socket_addr, directory, rename, client_addr, rrq).await {
                 Ok(()) => (),
                 Err(FileNotFound) => {
                     log::warn!("file not found");
@@ -210,6 +214,7 @@ struct FileNotFound;
 async fn handle_rrq(
     socket_addr: SocketAddr,
     directory: &str,
+    rename: Option<&str>,
     client_addr: ClientAddr,
     rrq: Rrq,
 ) -> Result<(), FileNotFound> {
@@ -223,8 +228,13 @@ async fn handle_rrq(
         rrq.filename,
         client_addr.0
     );
-
-    let path = std::path::Path::new(directory).join(rrq.filename.as_str());
+    let filename_str = if let Some(rename) = rename {
+        log::info!("Sending file \"{}\" instead", rename);
+        rename
+    } else {
+        rrq.filename.as_str()
+    };
+    let path = std::path::Path::new(directory).join(filename_str);
     let mut file = fs::File::open(&path).await.map_err(|_| FileNotFound)?;
     let mut ephemeral_socket = make_ephemeral_socket(socket_addr).await;
     let mut read_into_buf = vec![0u8; BLOCK_SIZE + DATA_OFFSET];
@@ -282,7 +292,13 @@ async fn main() {
     let Args {
         socket_addr,
         directory,
+        rename,
     } = Args::arg().with_help_default().parse_env_or_exit();
     env_logger::init();
-    run_server(socket_addr, directory.as_str()).await;
+    run_server(
+        socket_addr,
+        directory.as_str(),
+        rename.as_ref().map(|s| s.as_str()),
+    )
+    .await;
 }
