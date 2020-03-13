@@ -10,6 +10,7 @@ struct Args {
     socket_addr: SocketAddr,
     directory: String,
     rename: Option<String>,
+    verbose: bool,
 }
 
 impl Args {
@@ -22,11 +23,13 @@ impl Args {
                     simon::opt("d", "directory", "serve files out of directory", "DIR")
                 ).with_default_lazy(|| ".".to_string());
                 rename = simon::opt("r", "rename", "interpret requests for all files as requests for this file", "FILENAME");
+                verbose = simon::flag("v", "verbose", "be more verbose");
             } in {
                 Self {
                     socket_addr: SocketAddr::V4(socket_addr_v4),
                     directory: directory.to_string(),
                     rename,
+                    verbose,
                 }
             }
         }
@@ -115,15 +118,15 @@ async fn make_ephemeral_socket(socket_addr: SocketAddr) -> UdpSocket {
 enum ResponseError {
     Unimplemented,
     ParseError,
-    FileNotFound,
+    FileNotFound(String),
 }
 
 impl ResponseError {
     fn encode(self) -> Vec<u8> {
         let (code, message) = match self {
-            Self::Unimplemented => (0, "unimplemented"),
-            Self::ParseError => (0, "error parsing request"),
-            Self::FileNotFound => (1, "file not found"),
+            Self::Unimplemented => (0, "unimplemented".to_string()),
+            Self::ParseError => (0, "error parsing request".to_string()),
+            Self::FileNotFound(s) => (1, format!("file not found: {}", s)),
         };
         let mut out = vec![0, 5, 0, code];
         out.extend_from_slice(message.as_bytes());
@@ -181,6 +184,11 @@ impl MainSocket {
 }
 
 async fn run_server(socket_addr: SocketAddr, directory: &str, rename: Option<&str>) {
+    log::info!("Listening on {}", socket_addr);
+    log::info!("Serving files out of {}", directory);
+    if let Some(rename) = rename {
+        log::info!("Will rename all requests to {}", rename);
+    }
     MainSocket {
         socket: UdpSocket::bind(socket_addr).await.unwrap(),
         buf: vec![0; BUF_SIZE],
@@ -191,9 +199,9 @@ async fn run_server(socket_addr: SocketAddr, directory: &str, rename: Option<&st
         match rrq_result {
             Ok(rrq) => match handle_rrq(socket_addr, directory, rename, client_addr, rrq).await {
                 Ok(()) => (),
-                Err(FileNotFound) => {
-                    log::warn!("file not found");
-                    handle_error(socket_addr, client_addr, ResponseError::FileNotFound).await;
+                Err(FileNotFound(s)) => {
+                    log::warn!("file not found: {}", s);
+                    handle_error(socket_addr, client_addr, ResponseError::FileNotFound(s)).await;
                 }
             },
             Err(MainSocketError::ParseError) => {
@@ -209,7 +217,7 @@ async fn run_server(socket_addr: SocketAddr, directory: &str, rename: Option<&st
     .await;
 }
 
-struct FileNotFound;
+struct FileNotFound(String);
 
 async fn handle_rrq(
     socket_addr: SocketAddr,
@@ -224,7 +232,7 @@ async fn handle_rrq(
     const OPCODE: u8 = 3;
     let start_time = Instant::now();
     log::info!(
-        "Handling read request for {} from {}",
+        "Handling read request for \"{}\" from {}",
         rrq.filename,
         client_addr.0
     );
@@ -235,7 +243,9 @@ async fn handle_rrq(
         rrq.filename.as_str()
     };
     let path = std::path::Path::new(directory).join(filename_str);
-    let mut file = fs::File::open(&path).await.map_err(|_| FileNotFound)?;
+    let mut file = fs::File::open(&path)
+        .await
+        .map_err(|_| FileNotFound(filename_str.to_string()))?;
     let mut ephemeral_socket = make_ephemeral_socket(socket_addr).await;
     let mut read_into_buf = vec![0u8; BLOCK_SIZE + DATA_OFFSET];
     read_into_buf[0] = 0;
@@ -293,8 +303,14 @@ async fn main() {
         socket_addr,
         directory,
         rename,
+        verbose,
     } = Args::arg().with_help_default().parse_env_or_exit();
-    env_logger::init();
+    let level_filter = if verbose {
+        log::LevelFilter::Info
+    } else {
+        log::LevelFilter::Warn
+    };
+    env_logger::builder().filter_level(level_filter).init();
     run_server(
         socket_addr,
         directory.as_str(),
