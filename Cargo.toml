@@ -6,8 +6,8 @@ authors = ["Stephen Sherratt <stephen@sherra.tt>"]
 edition = "2018"
 license = "MIT"
 readme = "README.md"
-homepage = "https://github.com/stevebob/tftp-ro"
-repository = "https://github.com/stevebob/tftp-ro"
+homepage = "https://github.com/gridbugs/tftp-ro"
+repository = "https://github.com/gridbugs/tftp-ro"
 
 [dependencies]
 tokio = { version = "0.2", features = ["macros", "fs", "udp", "stream", "io-util"] }
